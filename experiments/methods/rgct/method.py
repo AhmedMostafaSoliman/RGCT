@@ -165,8 +165,7 @@ def _project_simplex(values: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     rho = cols - torch.flip(mask.int(), [1]).argmax(dim=1)
     rho = rho.clamp(min=1)
     theta = (cumsum[torch.arange(rows, device=values.device), rho - 1] - 1.0) / rho.to(values.dtype)
-    projected = (values - theta.unsqueeze(1)).clamp(min=eps)
-    return projected / projected.sum(dim=1, keepdim=True).clamp(min=eps)
+    return (values - theta.unsqueeze(1)).clamp(min=eps)
 
 
 def _apply_graph_gradient(values: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:

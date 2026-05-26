@@ -38,7 +38,7 @@ from utils.wandb import WandbLogger
 
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-SEED = 42
+SEED = 20260342
 META_DATASET_DEFAULT_ROOT = "/home/ahmedm04/projects/DINOSEG/datasets/meta-dataset"
 META_IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".ppm"}
 
@@ -524,10 +524,10 @@ def build_dataset(args, transform):
             return FastWrapFewShotDataset(MyDataSet(args.mini_imagenet_root, transform=transform))
         if args.mini_imagenet_json:
             return FastWrapFewShotDataset(MiniImageNetDataset(args.mini_imagenet_json, transform=transform))
-        default_root = "/home_old/ahmedm04/mini-imagenet-tools/mini_imagenet_split/val"
+        default_root = "/home_old/ahmedm04/few_shot_ds/mini-imagenet-tools/mini_imagenet_split/val"
         return FastWrapFewShotDataset(MyDataSet(default_root, transform=transform))
     if args.dataset == "tieredImageNet":
-        root = args.tiered_imagenet_root or "/home_old/ahmedm04/tiered-imagenet-tools/tiered_imagenet/val"
+        root = args.tiered_imagenet_root or "/home_old/ahmedm04/few_shot_ds/tiered-imagenet-tools/tiered_imagenet/val"
         return FastWrapFewShotDataset(MyDataSet(root, transform=transform))
     raise ValueError(f"Unknown dataset: {args.dataset}")
 
@@ -776,7 +776,7 @@ def main() -> None:
         f.write(
             f"[RGCTDual_v9_sharp] Dataset: {args.dataset}, Backbone: {args.backbone}, "
             f"Nway: {args.n_way}, Nshot: {args.n_shot}, Nquery: {args.n_query}, "
-            f"use_specific_trans: {args.use_specific_trans}, {hparams}, "
+            f"seed: {args.seed}, use_specific_trans: {args.use_specific_trans}, {hparams}, "
             f"md_test_type: {args.md_test_type}, Accuracy: {acc:.6f}, Note: {args.note}\n"
         )
 

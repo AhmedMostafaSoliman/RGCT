@@ -15,7 +15,7 @@ import torch
 
 DEFAULT_META_DATASET_CODE_ROOT = "/home/ahmedm04/projects/DINOSEG/meta-dataset"
 DEFAULT_META_DATASET_RECORDS_ROOT = (
-    "/home/ahmedm04/projects/DINOSEG/datasets/meta-dataset/processed_data"
+    "/home_old/ahmedm04/few_shot_ds/meta-dataset/processed_data"
 )
 
 META_DATASET_TEST_DATASETS = [
