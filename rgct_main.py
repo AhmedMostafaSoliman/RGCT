@@ -665,10 +665,11 @@ def main() -> None:
     if is_meta_dataset:
         args.dataset = canonicalize_meta_dataset_name(args.dataset)
 
-    set_seed(args.seed)
-
     image_size = 224
     model, patch_size, default_transform = load_dino_backbone(args.backbone, image_size, args.device)
+    # Match the historical RGCT runner: model construction/loading happens before
+    # seeding so episode sampling and CTB support randperm consume the same stream.
+    set_seed(args.seed)
     transforms_by_dataset = build_ds_transforms(image_size)
     if args.use_specific_trans:
         transform_key = _dataset_transform_key(args.dataset)

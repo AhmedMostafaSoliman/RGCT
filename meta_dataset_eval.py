@@ -13,7 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 
-DEFAULT_META_DATASET_CODE_ROOT = "/home/ahmedm04/projects/DINOSEG/meta-dataset"
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_META_DATASET_CODE_ROOT = "meta-dataset"
 DEFAULT_META_DATASET_RECORDS_ROOT = (
     "/home_old/ahmedm04/few_shot_ds/meta-dataset/processed_data"
 )
@@ -137,6 +138,13 @@ def canonicalize_meta_dataset_name(name: str) -> str:
 def is_meta_dataset_name(name: str) -> bool:
     key = _normalize_alias(name)
     return key in _META_ALIASES or key.replace("_", "") in _META_ALIASES
+
+
+def _resolve_project_relative_path(root: str | Path) -> Path:
+    path = Path(root).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
 
 
 def remap_episode_labels(
@@ -501,7 +509,7 @@ class MetaDatasetEpisodeSampler:
             raise RuntimeError(
                 "Meta-Dataset code root is not set. Provide --meta_dataset_root or set $META_DATASET_ROOT."
             )
-        resolved = Path(root).resolve()
+        resolved = _resolve_project_relative_path(root)
         if not resolved.exists():
             raise FileNotFoundError(f"Meta-Dataset root does not exist: {resolved}")
         return resolved
@@ -513,7 +521,7 @@ class MetaDatasetEpisodeSampler:
             raise RuntimeError(
                 "Meta-Dataset records root is not set. Provide --meta_records_root or set $RECORDS."
             )
-        resolved = Path(root).resolve()
+        resolved = _resolve_project_relative_path(root)
         if not resolved.exists():
             raise FileNotFoundError(f"Meta-Dataset records root does not exist: {resolved}")
         return resolved

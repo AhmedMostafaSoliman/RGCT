@@ -7,7 +7,7 @@ This module intentionally contains only the implementation needed for
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,7 +15,6 @@ import torch.nn.functional as F
 from easyfsl.methods import FewShotClassifier
 
 from utils.sinkhorn_unbalanced_torch import (
-    sinkhorn_balanced_torch,
     sinkhorn_knopp_unbalanced_torch,
 )
 
@@ -52,234 +51,323 @@ def vit_whole_embeddings(backbone: torch.nn.Module, images: torch.Tensor) -> tor
 
 
 def unbalanced_barycenter_fixed_support(
-    measures: List[torch.Tensor],
-    n_support: int = 64,
-    reg: float = 0.02,
-    reg_m: float = 0.3,
-    numItermax: int = 5,
-    inner_max: int = 30,
+    measures: List[torch.Tensor],   # List of [N_k, D] tensors
+    n_support: int = 64,            # L: number of atoms in barycenter
+    reg: float = 0.05,              # Entropy
+    reg_m: float = 0.5,             # Marginal relaxation (unbalancedness)
+    numItermax: int = 10,           # Outer barycenter iterations
+    inner_max: int = 100,           # Inner Sinkhorn iterations
     stopThr: float = 1e-4,
-    measure_weights: Optional[List[torch.Tensor]] = None,
+    init_type: str = "random",      # 'random' or 'kmeans'
+    measure_weights: Optional[List[torch.Tensor]] = None,  # Optional per-measure marginals
 ) -> torch.Tensor:
-    """Fixed-support unbalanced Wasserstein barycenter used by CTB support."""
-    if not measures:
-        raise ValueError("measures must be non-empty")
-
-    n_measures = len(measures)
+    """
+    Computes the Unbalanced Wasserstein Barycenter with fixed support size.
+    Returns: Z [n_support, D] (the prototype features)
+    """
+    K = len(measures)
+    D = measures[0].shape[1]
     device = measures[0].device
+    
+    # 1. Initialize Z
     all_points = torch.cat(measures, dim=0)
-    n_total = all_points.size(0)
-
-    if n_total <= n_support:
-        support = all_points.double()
+    N_total = all_points.shape[0]
+    
+    if init_type == "random" or N_total <= n_support:
+        if N_total <= n_support:
+            Z = all_points.double()
+        else:
+            idx = torch.randperm(N_total, device=device)[:n_support]
+            Z = all_points[idx].double()
     else:
-        idx = torch.randperm(n_total, device=device)[:n_support]
-        support = all_points[idx].double()
-
-    a = torch.full(
-        (support.size(0),),
-        1.0 / float(support.size(0)),
-        device=device,
-        dtype=torch.float64,
-    )
-
+        # Simple random default
+        idx = torch.randperm(N_total, device=device)[:n_support]
+        Z = all_points[idx].double()
+        
+    a = torch.full((Z.shape[0],), 1.0 / Z.shape[0], device=device, dtype=torch.float64)
+    
+    # Optional per-measure marginals (used for trimmed/weighted barycenters).
     b_list: List[torch.Tensor] = []
     if measure_weights is not None:
-        if len(measure_weights) != n_measures:
+        if len(measure_weights) != K:
             raise ValueError(
-                f"measure_weights must have length {n_measures}, got {len(measure_weights)}"
+                f"measure_weights must have length {K}, got {len(measure_weights)}"
             )
-        for idx, (measure, weights) in enumerate(zip(measures, measure_weights)):
-            if weights.numel() != measure.size(0):
+        for k in range(K):
+            S_k = measures[k]
+            b_k = measure_weights[k]
+            if b_k.numel() != S_k.shape[0]:
                 raise ValueError(
-                    f"measure_weights[{idx}] has {weights.numel()} entries, "
-                    f"expected {measure.size(0)}"
+                    f"measure_weights[{k}] has {b_k.numel()} entries, expected {S_k.shape[0]}"
                 )
-            weights = weights.to(device=device, dtype=torch.float64).clamp(min=1e-12)
-            b_list.append(weights / weights.sum().clamp(min=1e-12))
+            b_k = b_k.to(device=device, dtype=torch.float64).clamp(min=1e-12)
+            b_k = b_k / (b_k.sum() + 1e-12)
+            b_list.append(b_k)
     else:
-        for measure in measures:
-            b_list.append(
-                torch.full(
-                    (measure.size(0),),
-                    1.0 / float(measure.size(0)),
-                    device=device,
-                    dtype=torch.float64,
-                )
-            )
+        for k in range(K):
+            N_k = measures[k].shape[0]
+            b_k = torch.full((N_k,), 1.0 / N_k, device=device, dtype=torch.float64)
+            b_list.append(b_k)
 
-    for _ in range(int(numItermax)):
-        numerator = torch.zeros_like(support)
-        denominator = torch.zeros((support.size(0), 1), device=device, dtype=torch.float64)
-
-        for measure, b in zip(measures, b_list):
-            target = measure.double()
-            sim = torch.clamp(support @ target.t(), -1.0, 1.0)
-            cost = 1.0 - sim
-            plan = sinkhorn_knopp_unbalanced_torch(
-                M=cost.unsqueeze(0),
-                a=a.unsqueeze(0),
-                b=b.unsqueeze(0),
-                reg=reg,
-                reg_m=reg_m,
-                numItermax=inner_max,
-                stopThr=stopThr,
+    # 2. Alternating Minimization
+    for it in range(numItermax):
+        numerator = torch.zeros_like(Z)
+        denominator = torch.zeros((Z.shape[0], 1), device=device, dtype=torch.float64)
+        
+        for k in range(K):
+            S_k = measures[k].double()
+            b_k = b_list[k]
+            
+            sim = torch.clamp(Z @ S_k.t(), -1.0, 1.0)
+            M_k = 1.0 - sim
+            
+            Gamma_k = sinkhorn_knopp_unbalanced_torch(
+                M=M_k.unsqueeze(0), a=a.unsqueeze(0), b=b_k.unsqueeze(0),
+                reg=reg, reg_m=reg_m, numItermax=inner_max, stopThr=stopThr
             )[0]
-            numerator += plan @ target
-            denominator += plan.sum(dim=1, keepdim=True)
+            
+            numerator += Gamma_k @ S_k
+            denominator += Gamma_k.sum(dim=1, keepdim=True)
+            
+        # Update Z
+        valid_mask = (denominator > 1e-12)
+        Z_new = torch.where(valid_mask, numerator / denominator, Z)
+        
+        # Normalize Z to unit sphere (Crucial for Cosine Distance / DINO)
+        Z_new = torch.nn.functional.normalize(Z_new, p=2, dim=1)
+        
+        Z = Z_new
+        
+    return Z.float()
 
-        support = torch.where(denominator > 1e-12, numerator / denominator, support)
-        support = F.normalize(support, p=2, dim=1, eps=1e-12)
 
-    return support.float()
+def _build_grid_edges(P: int, device: torch.device) -> torch.Tensor:
+    """Build 4-connected grid edges for a square patch grid.
 
-
-def _build_grid_edges(patches: int, device: torch.device) -> torch.Tensor:
-    """Build directed 4-connected edges for a square patch grid."""
-    height = width = int(math.sqrt(patches))
-    if height * width != patches:
-        height, width = 1, patches
-
-    src: List[int] = []
-    dst: List[int] = []
-    for row in range(height):
-        for col in range(width):
-            idx = row * width + col
-            if col + 1 < width:
-                src.extend([idx, idx + 1])
-                dst.extend([idx + 1, idx])
-            if row + 1 < height:
-                down = (row + 1) * width + col
-                src.extend([idx, down])
-                dst.extend([down, idx])
+    Returns edge_index [2, E] in COO format.
+    """
+    H = W = int(math.sqrt(P))
+    if H * W != P:
+        # Fallback: chain graph
+        H, W = 1, P
+    src, dst = [], []
+    for r in range(H):
+        for c in range(W):
+            idx = r * W + c
+            if c + 1 < W:
+                src.append(idx); dst.append(idx + 1)
+                src.append(idx + 1); dst.append(idx)
+            if r + 1 < H:
+                src.append(idx); dst.append((r + 1) * W + c)
+                src.append((r + 1) * W + c); dst.append(idx)
     return torch.tensor([src, dst], dtype=torch.long, device=device)
 
 
-def _project_simplex(values: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """Project each row of ``values`` onto the probability simplex."""
-    rows, cols = values.shape
-    sorted_values, _ = torch.sort(values, dim=1, descending=True)
-    cumsum = torch.cumsum(sorted_values, dim=1)
-    rho_range = torch.arange(1, cols + 1, device=values.device, dtype=values.dtype).unsqueeze(0)
-    mask = (sorted_values - (cumsum - 1.0) / rho_range) > 0
-    rho = cols - torch.flip(mask.int(), [1]).argmax(dim=1)
+def _project_simplex(Z: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Project each row of Z onto the probability simplex Δ^K.
+
+    Uses the efficient sorting-based algorithm of Condat (2016).
+    Z: [P, K]  →  Z_proj: [P, K], each row sums to 1, all entries ≥ 0.
+    """
+    P, K = Z.shape
+    sorted_z, _ = torch.sort(Z, dim=1, descending=True)
+    cumsum = torch.cumsum(sorted_z, dim=1)
+    rho_range = torch.arange(1, K + 1, device=Z.device, dtype=Z.dtype).unsqueeze(0)
+    mask = (sorted_z - (cumsum - 1.0) / rho_range) > 0
+    rho = K - torch.flip(mask.int(), [1]).argmax(dim=1)  # [P]
     rho = rho.clamp(min=1)
-    theta = (cumsum[torch.arange(rows, device=values.device), rho - 1] - 1.0) / rho.to(values.dtype)
-    return (values - theta.unsqueeze(1)).clamp(min=eps)
+    theta = (cumsum[torch.arange(P, device=Z.device), rho - 1] - 1.0) / rho.to(Z.dtype)
+    return (Z - theta.unsqueeze(1)).clamp(min=eps)
 
 
-def _apply_graph_gradient(values: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+def _apply_graph_gradient(
+    Z: torch.Tensor,
+    edge_index: torch.Tensor,
+) -> torch.Tensor:
+    """Compute DZ: differences along graph edges.
+
+    Z: [B, P, K]  →  DZ: [B, E, K]  where DZ[e] = Z[src[e]] - Z[dst[e]]
+    """
     src, dst = edge_index[0], edge_index[1]
-    return values[:, src] - values[:, dst]
+    return Z[:, src] - Z[:, dst]  # [B, E, K]
 
 
-def _apply_graph_divergence(values: torch.Tensor, edge_index: torch.Tensor, patches: int) -> torch.Tensor:
-    batch, edges, channels = values.shape
+def _apply_graph_divergence(
+    Y: torch.Tensor,
+    edge_index: torch.Tensor,
+    P: int,
+) -> torch.Tensor:
+    """Adjoint of graph gradient: D^T Y.
+
+    Y: [B, E, K]  →  div: [B, P, K]
+    div[j] = Σ_{e: src(e)=j} Y[e]  -  Σ_{e: dst(e)=j} Y[e]
+    """
+    B, E, K = Y.shape
     src, dst = edge_index[0], edge_index[1]
-    div = torch.zeros((batch, patches, channels), device=values.device, dtype=values.dtype)
-    div.scatter_add_(1, src.view(1, edges, 1).expand(batch, edges, channels), values)
-    div.scatter_add_(1, dst.view(1, edges, 1).expand(batch, edges, channels), -values)
+    div = torch.zeros((B, P, K), device=Y.device, dtype=Y.dtype)
+    # + Y for source nodes, - Y for destination nodes
+    div.scatter_add_(1, src.unsqueeze(0).unsqueeze(2).expand(B, E, K), Y)
+    div.scatter_add_(1, dst.unsqueeze(0).unsqueeze(2).expand(B, E, K), -Y)
     return div
 
 
 def _solve_semi_relaxed_ot_with_dual(
-    cost: torch.Tensor,
-    alpha: torch.Tensor,
-    support_mass: torch.Tensor,
+    M_c: torch.Tensor,
+    alpha_c: torch.Tensor,
+    b_c: torch.Tensor,
     reg: float,
     reg_mass_col: float,
     sinkhorn_iters: int,
-    warmstart: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Solve semi-relaxed OT and return plan plus source dual potential."""
+    warmstart: "Optional[Tuple[torch.Tensor, torch.Tensor]]" = None,
+    eps: float = 1e-12,
+) -> "Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]":
+    """Solve semi-relaxed entropic OT and extract source dual potential.
+
+    Semi-relaxed = exact row marginals (fi_1=1), relaxed column marginals.
+
+    Returns
+    -------
+    Gamma_c : [B, P, N_c]  transport plan
+    phi_c   : [B, P]  source dual potential = ε·log(u), zero-mean normalised
+    warmstart_out : (logu, logv) for warm-starting next call
+    """
     plan, log_dict = sinkhorn_knopp_unbalanced_torch(
-        M=cost,
-        a=alpha,
-        b=support_mass,
+        M=M_c,
+        a=alpha_c,
+        b=b_c,
         reg=reg,
-        reg_m=(float("inf"), reg_mass_col),
+        reg_m=(float('inf'), reg_mass_col),
         numItermax=sinkhorn_iters,
         stopThr=1e-6,
         log=True,
         warmstart=warmstart,
     )
-    logu = log_dict["logu"]
-    logv = log_dict["logv"]
-    return plan, reg * logu, (logu, logv)
+    logu = log_dict["logu"]  # [B, P]
+    logv = log_dict["logv"]  # [B, N_c]
+
+    # Source dual potential: φ_c = ε · log(u)
+    # For semi-relaxed OT with exact row marginals (fi_1=1), this is
+    # exactly ∂F_c(α_c)/∂α_c.  The additive gauge constant is absorbed
+    # by the simplex projection in PDHG, so we use the RAW dual.
+    # NOTE: previous code zero-mean centered each class independently,
+    # which destroyed cross-class level information needed for simplex
+    # competition (class c₁ matching well vs c₂ matching poorly both
+    # mapped to mean zero).
+    phi_c = reg * logu  # [B, P]
+
+    warmstart_out = (logu, logv)
+    return plan, phi_c, warmstart_out
 
 
 def _rgct_z_step_pdhg(
-    linear_cost: torch.Tensor,
-    z_prev: torch.Tensor,
+    G: torch.Tensor,
+    Z_prev: torch.Tensor,
     edge_index: torch.Tensor,
     edge_weights: torch.Tensor,
     lambda_tv: float,
     tau_z: float,
     n_iters: int,
     eps: float = 1e-12,
-) -> Tuple[torch.Tensor, List[float]]:
-    """Solve the RGCT-Dual allocation subproblem via Chambolle-Pock PDHG."""
-    batch, patches, channels = linear_cost.shape
-    edges = edge_index.size(1)
-    device = linear_cost.device
-    dtype = linear_cost.dtype
+) -> "Tuple[torch.Tensor, List[float]]":
+    """Solve the Z-subproblem via PDHG (Chambolle-Pock).
 
-    if edges > 0:
-        degree = torch.zeros(patches, device=device, dtype=torch.long)
-        degree.scatter_add_(0, edge_index[0], torch.ones(edges, device=device, dtype=torch.long))
-        degree.scatter_add_(0, edge_index[1], torch.ones(edges, device=device, dtype=torch.long))
-        graph_norm = max(2.0 * float(degree.max().item()), 1.0)
+    minimize_Z  <G, Z>  +  λ_tv · TV(Z)  +  (1/(2τ)) · ||Z - Z_prev||²
+    s.t.  z_j ∈ Δ^K  for all j
+
+    TV(Z) = Σ_e w_e ||Z[src(e)] - Z[dst(e)]||_1   (anisotropic weighted)
+
+    Parameters
+    ----------
+    G         : [B, P, K]  linear cost (includes a*phi_c and clutter terms)
+    Z_prev    : [B, P, K]  proximal centre
+    edge_index: [2, E]  COO edge list
+    edge_weights: [B, E]  per-edge weights
+    lambda_tv : TV weight
+    tau_z     : proximal step size
+    n_iters   : number of PDHG iterations
+
+    Returns
+    -------
+    Z_out     : [B, P, K]  solution
+    obj_hist  : list of primal objective values per iteration
+    """
+    B, P, K = G.shape
+    E = edge_index.size(1)
+    device, dtype = G.device, G.dtype
+
+    # Step size selection
+    # ||D||² ≤ 2 * max_degree for a graph gradient operator
+    if E > 0:
+        # Compute max degree from edge_index
+        degree = torch.zeros(P, device=device, dtype=torch.long)
+        degree.scatter_add_(0, edge_index[0], torch.ones(E, device=device, dtype=torch.long))
+        degree.scatter_add_(0, edge_index[1], torch.ones(E, device=device, dtype=torch.long))
+        L_D = 2.0 * float(degree.max().item())
+        L_D = max(L_D, 1.0)
     else:
-        graph_norm = 1.0
+        L_D = 1.0
 
-    sigma = 1.0 / (1.0 / tau_z + lambda_tv * graph_norm) if lambda_tv > 0 else tau_z
-    tau_dual = 1.0 / (lambda_tv * graph_norm) if lambda_tv > 0 else 1.0
+    # Primal step: σ = 1 / (1/τ + λ_tv * L_D)
+    # Dual step:   τ_d = 1 / (λ_tv * L_D)   (only relevant if λ_tv > 0)
+    sigma_p = 1.0 / (1.0 / tau_z + lambda_tv * L_D) if lambda_tv > 0 else tau_z / (1.0 + tau_z * 0.01)
+    tau_d = 1.0 / (lambda_tv * L_D) if (lambda_tv > 0 and L_D > 0) else 1.0
 
-    z = z_prev.clone()
-    z_bar = z.clone()
-    dual = (
-        torch.zeros((batch, edges, channels), device=device, dtype=dtype)
-        if edges > 0 and lambda_tv > 0
-        else None
-    )
-    obj_history: List[float] = []
+    # Initialise: Z = Z_prev, Y = 0
+    Z = Z_prev.clone()
+    Z_bar = Z.clone()
+    if E > 0 and lambda_tv > 0:
+        Y = torch.zeros((B, E, K), device=device, dtype=dtype)
+    else:
+        Y = None
 
-    for _ in range(int(n_iters)):
-        z_old = z.clone()
+    obj_hist = []
 
-        if dual is not None:
-            dual = dual + tau_dual * _apply_graph_gradient(z_bar, edge_index)
-            threshold = lambda_tv * edge_weights.unsqueeze(2)
-            dual = dual.clamp(-threshold, threshold)
+    for it in range(n_iters):
+        Z_old = Z.clone()
 
-        grad = linear_cost + (z - z_prev) / tau_z
-        if dual is not None:
-            grad = grad + _apply_graph_divergence(dual, edge_index, patches)
+        # --- Dual step: Y ← prox_{λ_tv * w * ||·||_1}(Y + τ_d · D · Z_bar) ---
+        if Y is not None and lambda_tv > 0:
+            DZ_bar = _apply_graph_gradient(Z_bar, edge_index)  # [B, E, K]
+            Y = Y + tau_d * DZ_bar
+            # Proximal of λ_tv * w * ||·||_1  =  soft-thresholding
+            # threshold per edge: λ_tv * w_e * τ_d  — but we already folded τ_d
+            # Actually for Chambolle-Pock, the dual prox is projection onto
+            # the dual ball: ||Y_e / (λ_tv * w_e)||_∞ ≤ 1
+            thresh = lambda_tv * edge_weights.unsqueeze(2)  # [B, E, 1]
+            Y = Y.clamp(-thresh, thresh)
 
-        z = z - sigma * grad
-        for batch_idx in range(batch):
-            z[batch_idx] = _project_simplex(z[batch_idx], eps=eps)
+        # --- Primal step: Z ← proj_simplex(Z - σ(G + (Z - Z_prev)/τ + D^T Y)) ---
+        grad = G + (Z - Z_prev) / tau_z
+        if Y is not None and lambda_tv > 0:
+            grad = grad + _apply_graph_divergence(Y, edge_index, P)
+        Z = Z - sigma_p * grad
+        # Project each row onto simplex
+        for b_idx in range(B):
+            Z[b_idx] = _project_simplex(Z[b_idx], eps=eps)
 
-        z_bar = 2.0 * z - z_old
+        # --- Overrelaxation ---
+        Z_bar = 2.0 * Z - Z_old
 
-        obj_linear = (linear_cost * z).sum(dim=(1, 2))
-        obj_prox = 0.5 / tau_z * ((z - z_prev) ** 2).sum(dim=(1, 2))
-        if dual is not None:
-            dz = _apply_graph_gradient(z, edge_index)
-            obj_tv = (lambda_tv * edge_weights.unsqueeze(2) * dz.abs()).sum(dim=(1, 2))
+        # --- Track objective ---
+        obj_linear = (G * Z).sum(dim=(1, 2))  # [B]
+        obj_prox = 0.5 / tau_z * ((Z - Z_prev) ** 2).sum(dim=(1, 2))  # [B]
+        if E > 0 and lambda_tv > 0:
+            DZ = _apply_graph_gradient(Z, edge_index)
+            obj_tv = (lambda_tv * edge_weights.unsqueeze(2) * DZ.abs()).sum(dim=(1, 2))
         else:
-            obj_tv = torch.zeros(batch, device=device, dtype=dtype)
-        obj_history.append((obj_linear + obj_prox + obj_tv).mean().item())
+            obj_tv = torch.zeros(B, device=device, dtype=dtype)
+        obj = (obj_linear + obj_prox + obj_tv).mean().item()
+        obj_hist.append(obj)
 
-    return z, obj_history
+    return Z, obj_hist
 
 
 @torch.no_grad()
 def rgct_dual_score_batched(
-    query_tokens: torch.Tensor,
-    support_classes: List[torch.Tensor],
-    support_masses: List[torch.Tensor],
-    reg_eps: float = 0.02,
+    Q_batch: torch.Tensor,
+    S_classes: "List[torch.Tensor]",
+    b_classes: "List[torch.Tensor]",
+    reg_eps: float = 0.05,
     reg_mass: float = 0.3,
     sinkhorn_iters: int = 200,
     lambda_tv: float = 0.1,
@@ -290,112 +378,316 @@ def rgct_dual_score_batched(
     use_clutter: bool = True,
     anisotropic_tv: bool = True,
     rgct_scoring: str = "primal",
+    eps_anneal_iters: int = 0,
+    eps_anneal_start: float = 0.2,
+    tv_ramp_iters: int = 0,
+    verbose: bool = False,
+    return_diagnostics: bool = False,
     eps: float = 1e-12,
-) -> torch.Tensor:
-    """Compute RGCT-Dual class logits for a batch of query token sets."""
-    batch, patches, _ = query_tokens.shape
-    n_way = len(support_classes)
-    device = query_tokens.device
+) -> "torch.Tensor | Tuple[torch.Tensor, Dict[str, Any]]":
+    """RGCT-Dual: Principled reduced-objective solver.
+
+    Prox-linear alternating minimisation over:
+      J(Z) = Σ_c F_c(a ⊙ z_c) + λ_tv · TV(Z) + λ_clutter · Σ_j z_{j,0}
+    s.t.  z_j ∈ Δ^{K_total}
+
+    The Z-update uses the correct source dual potential φ_c = ∂F_c/∂α_c
+    (extracted from Sinkhorn scalings) and solves the proximal subproblem
+    via PDHG (Chambolle-Pock).
+
+    Returns
+    -------
+    logits : [B, C]  class logits.
+    """
+    B, P, D = Q_batch.shape
+    C = len(S_classes)
+    device = Q_batch.device
     dtype = torch.float64
 
-    n_channels = n_way + 1 if use_clutter else n_way
-    class_offset = 1 if use_clutter else 0
-    query_mass = torch.full((batch, patches), 1.0 / float(patches), device=device, dtype=dtype)
+    K_total = C + 1 if use_clutter else C
+    clutter_offset = 1 if use_clutter else 0
 
-    costs: List[torch.Tensor] = []
-    masses: List[torch.Tensor] = []
-    for support, support_mass in zip(support_classes, support_masses):
-        sim = torch.clamp(query_tokens.to(dtype) @ support.to(dtype).t(), -1.0, 1.0)
-        cost = 1.0 - sim
-        mass = support_mass.to(device=device, dtype=dtype).unsqueeze(0).expand(batch, -1)
-        mass = mass * (query_mass.sum(dim=1, keepdim=True) / mass.sum(dim=1, keepdim=True).clamp(min=eps))
-        costs.append(cost)
-        masses.append(mass)
+    # Query marginal
+    a = torch.full((B, P), 1.0 / float(P), device=device, dtype=dtype)
 
-    edge_index = _build_grid_edges(patches, device)
+    # Build cost matrices and normalised support marginals
+    M_list: "List[torch.Tensor]" = []
+    b_list: "List[torch.Tensor]" = []
+    for c in range(C):
+        S_c = S_classes[c]
+        N_c = S_c.size(0)
+        sim = torch.clamp(Q_batch.to(dtype) @ S_c.to(dtype).t(), -1.0, 1.0)
+        M_c = 1.0 - sim  # [B, P, N_c]
+        b_c = b_classes[c].to(device=device, dtype=dtype).unsqueeze(0).expand(B, N_c)
+        total_b = b_c.sum(dim=1, keepdim=True).clamp(min=eps)
+        b_c = b_c * (a.sum(dim=1, keepdim=True) / total_b)
+        M_list.append(M_c)
+        b_list.append(b_c)
+
+    # Build grid edges for TV
+    edge_index = _build_grid_edges(P, device)
+
+    # Compute anisotropic edge weights
     if anisotropic_tv and edge_index.size(1) > 0:
-        q64 = query_tokens.to(dtype)
-        weights = []
-        for batch_idx in range(batch):
-            src = q64[batch_idx, edge_index[0]]
-            dst = q64[batch_idx, edge_index[1]]
-            dist = ((src - dst) ** 2).sum(dim=1)
-            median = dist.median().clamp(min=eps)
-            weights.append(torch.exp(-dist / (2.0 * median)))
-        edge_weights = torch.stack(weights)
+        Q64 = Q_batch.to(dtype)
+        all_edge_weights = []
+        for b_idx in range(B):
+            src_feats = Q64[b_idx, edge_index[0]]
+            dst_feats = Q64[b_idx, edge_index[1]]
+            dists = ((src_feats - dst_feats) ** 2).sum(dim=1)
+            median_d = dists.median().clamp(min=eps)
+            w = torch.exp(-dists / (2.0 * median_d))
+            all_edge_weights.append(w)
+        batch_edge_weights = torch.stack(all_edge_weights)  # [B, E]
     else:
-        edge_weights = torch.ones((batch, edge_index.size(1)), device=device, dtype=dtype)
+        batch_edge_weights = torch.ones((B, edge_index.size(1)),
+                                         device=device, dtype=dtype)
 
-    z = torch.full((batch, patches, n_channels), 1.0 / float(n_channels), device=device, dtype=dtype)
-    warmstarts: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * n_way
-    plans: List[Optional[torch.Tensor]] = [None] * n_way
-    duals: List[Optional[torch.Tensor]] = [None] * n_way
+    # Initialise Z: uniform allocation
+    Z = torch.full((B, P, K_total), 1.0 / float(K_total),
+                    device=device, dtype=dtype)
 
-    for _ in range(int(outer_iters)):
-        for class_idx in range(n_way):
-            z_class = z[:, :, class_idx + class_offset].clamp(min=1e-8)
-            alpha = query_mass * z_class
-            plan, dual, warmstart = _solve_semi_relaxed_ot_with_dual(
-                cost=costs[class_idx],
-                alpha=alpha,
-                support_mass=masses[class_idx],
-                reg=reg_eps,
+    # Warm-start storage for OT solves
+    ot_warmstarts: "List[Optional[Tuple[torch.Tensor, torch.Tensor]]]" = [None] * C
+
+    # Diagnostics storage
+    diag_Z_history: List[torch.Tensor] = []
+    diag_obj_history: List[Dict[str, float]] = []
+
+    # ── Alternating optimisation ──
+    plans: "List[Optional[torch.Tensor]]" = [None] * C
+    phi_all: "List[Optional[torch.Tensor]]" = [None] * C
+
+    for outer in range(int(outer_iters)):
+
+        # ── Continuation / annealing ──
+        if eps_anneal_iters > 0 and outer < eps_anneal_iters:
+            t = float(outer) / float(eps_anneal_iters)
+            reg_eff = eps_anneal_start * (1.0 - t) + reg_eps * t
+        else:
+            reg_eff = reg_eps
+
+        if tv_ramp_iters > 0 and outer < tv_ramp_iters:
+            t = float(outer) / float(tv_ramp_iters)
+            tv_eff = lambda_tv * t
+        else:
+            tv_eff = lambda_tv
+
+        # ── BLOCK 1: OT solve + dual extraction (Z fixed) ──
+        total_ot_value = torch.zeros(B, device=device, dtype=dtype)
+        for c in range(C):
+            z_c = Z[:, :, c + clutter_offset].clamp(min=1e-8)  # [B, P]
+            alpha_c = a * z_c  # [B, P]   row marginal for class c
+
+            Gamma_c, phi_c, ws_out = _solve_semi_relaxed_ot_with_dual(
+                M_c=M_list[c],
+                alpha_c=alpha_c,
+                b_c=b_list[c],
+                reg=reg_eff,
                 reg_mass_col=reg_mass,
                 sinkhorn_iters=sinkhorn_iters,
-                warmstart=warmstarts[class_idx],
+                warmstart=ot_warmstarts[c],
+                eps=eps,
             )
-            plans[class_idx] = plan
-            duals[class_idx] = dual
-            warmstarts[class_idx] = warmstart
+            plans[c] = Gamma_c
+            phi_all[c] = phi_c
+            ot_warmstarts[c] = ws_out
 
-        linear = torch.zeros((batch, patches, n_channels), device=device, dtype=dtype)
-        for class_idx, dual in enumerate(duals):
-            linear[:, :, class_idx + class_offset] = query_mass * dual
+            # F_c value = <M_c, Gamma_c> + ε · KL(Gamma_c | c_mat)  (approx by primal cost)
+            total_ot_value = total_ot_value + (Gamma_c * M_list[c]).sum(dim=(1, 2))
+
+        # ── BLOCK 2: Z update via PDHG ──
+        # Build gradient G[:,:,c+offset] = a * phi_c
+        G = torch.zeros((B, P, K_total), device=device, dtype=dtype)
+        for c in range(C):
+            G[:, :, c + clutter_offset] = a * phi_all[c]
+
         if use_clutter:
-            linear[:, :, 0] = linear[:, :, 0] + lambda_clutter
+            G[:, :, 0] = G[:, :, 0] + lambda_clutter
 
-        z, _ = _rgct_z_step_pdhg(
-            linear_cost=linear,
-            z_prev=z,
+        Z_prev = Z.clone()
+        Z, pdhg_obj_hist = _rgct_z_step_pdhg(
+            G=G,
+            Z_prev=Z_prev,
             edge_index=edge_index,
-            edge_weights=edge_weights,
-            lambda_tv=lambda_tv,
+            edge_weights=batch_edge_weights,
+            lambda_tv=tv_eff,
             tau_z=tau_z,
             n_iters=z_pdhg_iters,
             eps=eps,
         )
 
-    for class_idx in range(n_way):
-        z_class = z[:, :, class_idx + class_offset].clamp(min=1e-8)
-        alpha = query_mass * z_class
-        plans[class_idx], _, _ = _solve_semi_relaxed_ot_with_dual(
-            cost=costs[class_idx],
-            alpha=alpha,
-            support_mass=masses[class_idx],
+        # ── Logging / diagnostics ──
+        # Compute diagnostic values (always, for diagnostics; print only if verbose)
+        if edge_index.size(1) > 0 and tv_eff > 0:
+            DZ = _apply_graph_gradient(Z, edge_index)
+            tv_val = (tv_eff * batch_edge_weights.unsqueeze(2) * DZ.abs()).sum(dim=(1, 2)).mean().item()
+        else:
+            tv_val = 0.0
+        clutter_mass = Z[:, :, 0].sum(dim=1).mean().item() if use_clutter else 0.0
+        z_change = ((Z - Z_prev) ** 2).sum(dim=(1, 2)).sqrt().mean().item()
+
+        if return_diagnostics:
+            diag_Z_history.append(Z.detach().cpu().clone())
+            diag_obj_history.append({
+                "outer": outer,
+                "ot_value": total_ot_value.mean().item(),
+                "tv_value": tv_val,
+                "clutter_mass": clutter_mass,
+                "z_change": z_change,
+                "pdhg_final_obj": pdhg_obj_hist[-1] if pdhg_obj_hist else 0.0,
+            })
+
+        if verbose:
+            fc_vals = []
+            for c in range(C):
+                fc = (plans[c] * M_list[c]).sum(dim=(1, 2)).mean().item()
+                fc_vals.append(fc)
+
+            print(f"  RGCT-Dual outer={outer}: "
+                  f"OT={total_ot_value.mean().item():.4f} "
+                  f"TV={tv_val:.4f} "
+                  f"clutter={clutter_mass:.4f} "
+                  f"||ΔZ||={z_change:.6f} "
+                  f"F_c={[f'{v:.4f}' for v in fc_vals]} "
+                  f"PDHG_obj={pdhg_obj_hist[-1]:.4f}" if pdhg_obj_hist else "")
+
+    # ── Final transport solve with converged Z ──
+    for c in range(C):
+        z_c = Z[:, :, c + clutter_offset].clamp(min=1e-8)
+        alpha_c = a * z_c
+        plans[c], _, _ = _solve_semi_relaxed_ot_with_dual(
+            M_c=M_list[c],
+            alpha_c=alpha_c,
+            b_c=b_list[c],
             reg=reg_eps,
             reg_mass_col=reg_mass,
             sinkhorn_iters=sinkhorn_iters,
-            warmstart=warmstarts[class_idx],
+            warmstart=ot_warmstarts[c],
+            eps=eps,
         )
 
-    primal_costs = torch.zeros((batch, n_way), device=device, dtype=dtype)
-    class_masses = torch.zeros((batch, n_way), device=device, dtype=dtype)
-    for class_idx, plan in enumerate(plans):
-        primal_costs[:, class_idx] = (plan * costs[class_idx]).sum(dim=(1, 2))
-        class_masses[:, class_idx] = plan.sum(dim=(1, 2))
-
+    # ── Compute logits ──
     scoring = str(rgct_scoring).strip().lower()
+    primal_costs = torch.zeros((B, C), device=device, dtype=dtype)
+    class_masses = torch.zeros((B, C), device=device, dtype=dtype)
+
+    for c in range(C):
+        primal_costs[:, c] = (plans[c] * M_list[c]).sum(dim=(1, 2))
+        class_masses[:, c] = plans[c].sum(dim=(1, 2))
+
     if scoring == "primal":
         logits = -primal_costs
     elif scoring == "mass":
         logits = torch.log(class_masses.clamp(min=eps))
     elif scoring == "hybrid":
-        logits = torch.log(class_masses.clamp(min=eps))
-        logits = logits - 0.5 * primal_costs / primal_costs.abs().mean(dim=1, keepdim=True).clamp(min=eps)
+        logits = (torch.log(class_masses.clamp(min=eps))
+                  - 0.5 * primal_costs / primal_costs.abs().mean(dim=1, keepdim=True).clamp(min=eps))
     else:
-        raise ValueError("rgct_scoring must be one of: primal, mass, hybrid")
+        logits = -primal_costs
 
-    return logits.to(torch.float32)
+    logits_out = logits.to(torch.float32)
+
+    if return_diagnostics:
+        diagnostics = {
+            "Z_final": Z.detach().cpu().clone(),
+            "Z_history": diag_Z_history,
+            "obj_history": diag_obj_history,
+            "primal_costs": primal_costs.detach().cpu().clone(),
+            "class_masses": class_masses.detach().cpu().clone(),
+        }
+        return logits_out, diagnostics
+
+    return logits_out
+
+
+def _sinkhorn_balanced_torch(
+    M: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    reg: float,
+    numItermax: int = 500,
+    stopThr: float = 1e-6,
+) -> torch.Tensor:
+    """Balanced Sinkhorn for 2D cost matrix. Thin wrapper."""
+    from utils.sinkhorn_unbalanced_torch import sinkhorn_balanced_torch
+    return sinkhorn_balanced_torch(M, a, b, reg=reg, numItermax=numItermax, stopThr=stopThr)
+
+
+def _normalize_branch_logits(logits: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    centered = logits - logits.mean(dim=1, keepdim=True)
+    scale = centered.std(dim=1, keepdim=True, unbiased=False).clamp_min(eps)
+    return centered / scale
+
+
+def _top2_margin(logits: torch.Tensor) -> torch.Tensor:
+    if logits.size(1) <= 1:
+        return logits.squeeze(1)
+    top2 = torch.topk(logits, k=2, dim=1).values
+    return top2[:, 0] - top2[:, 1]
+
+
+def _blend_global_parts_logits(
+    global_logits: torch.Tensor,
+    parts_logits: torch.Tensor,
+    alpha_global: float,
+    blend_mode: str = "fixed",
+    blend_margin_temp: float = 0.2,
+    override_global_margin_thresh: float = 0.1,
+    override_parts_delta_thresh: float = 0.0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    alpha = float(np.clip(alpha_global, 0.0, 1.0))
+    mode = str(blend_mode).strip().lower()
+    if mode == "fixed":
+        return (alpha * global_logits + (1.0 - alpha) * parts_logits).to(torch.float32)
+    if mode == "top2_override":
+        if global_logits.size(1) <= 1:
+            return global_logits.to(torch.float32)
+        top2_vals, top2_idx = torch.topk(global_logits.to(torch.float32), k=2, dim=1)
+        global_margin = top2_vals[:, 0] - top2_vals[:, 1]
+        batch_idx = torch.arange(global_logits.size(0), device=global_logits.device)
+        runner_delta = (
+            parts_logits[batch_idx, top2_idx[:, 1]] - parts_logits[batch_idx, top2_idx[:, 0]]
+        ).to(torch.float32)
+        override = (
+            (global_margin <= float(override_global_margin_thresh))
+            & (runner_delta >= float(override_parts_delta_thresh))
+        )
+        blended = global_logits.to(torch.float32).clone()
+        if override.any():
+            override_idx = torch.nonzero(override, as_tuple=False).squeeze(1)
+            winners = top2_idx[override, 0]
+            runners = top2_idx[override, 1]
+            winner_vals = top2_vals[override, 0]
+            runner_vals = top2_vals[override, 1]
+            boost = runner_delta[override].clamp_min(float(eps))
+            blended[override_idx, winners] = runner_vals
+            blended[override_idx, runners] = winner_vals + boost
+        return blended
+    if mode != "adaptive_margin":
+        raise ValueError(f"Unknown blend_mode '{blend_mode}'")
+
+    if alpha <= eps:
+        return parts_logits.to(torch.float32)
+    if alpha >= 1.0 - eps:
+        return global_logits.to(torch.float32)
+
+    global_norm = _normalize_branch_logits(global_logits.to(torch.float32), eps=eps)
+    parts_norm = _normalize_branch_logits(parts_logits.to(torch.float32), eps=eps)
+
+    global_margin = _top2_margin(global_norm)
+    parts_margin = _top2_margin(parts_norm)
+    temp = max(float(blend_margin_temp), eps)
+
+    prior_global = float(np.clip(alpha, eps, 1.0 - eps))
+    prior_local = 1.0 - prior_global
+    prior_logit = math.log(prior_local / prior_global)
+    gate_local = torch.sigmoid(
+        torch.tensor(prior_logit, device=global_norm.device, dtype=global_norm.dtype)
+        + (parts_margin - global_margin) / temp
+    ).unsqueeze(1)
+    return ((1.0 - gate_local) * global_norm + gate_local * parts_norm).to(torch.float32)
 
 
 def _calibrate_episode_logits(
@@ -404,19 +696,19 @@ def _calibrate_episode_logits(
     reg_eps: float,
     eps: float = 1e-12,
 ) -> torch.Tensor:
-    batch = logits.size(0)
-    cost = -logits.to(torch.float64)
-    query_mass = torch.full((batch,), 1.0 / float(batch), device=logits.device, dtype=torch.float64)
-    class_mass = torch.full((n_way,), 1.0 / float(n_way), device=logits.device, dtype=torch.float64)
-    plan = sinkhorn_balanced_torch(
-        cost,
-        query_mass,
-        class_mass,
+    bq = logits.size(0)
+    Mqc = -logits.to(torch.float64)
+    a_q = torch.full((bq,), 1.0 / float(bq), device=logits.device, dtype=torch.float64)
+    b_c = torch.full((n_way,), 1.0 / float(n_way), device=logits.device, dtype=torch.float64)
+    gamma_qc = _sinkhorn_balanced_torch(
+        Mqc,
+        a_q,
+        b_c,
         reg=float(reg_eps),
         numItermax=500,
         stopThr=1e-6,
     ).to(torch.float32)
-    return logits + torch.log(plan.clamp(min=eps))
+    return logits + torch.log(gamma_qc + eps)
 
 
 class RGCTDualNet(FewShotClassifier):
@@ -438,8 +730,13 @@ class RGCTDualNet(FewShotClassifier):
         support_gate_temp: float = 0.5,
         support_num_iter: int = 120,
         alpha_global: float = 0.4,
+        blend_mode: str = "fixed",
+        blend_margin_temp: float = 0.2,
+        override_global_margin_thresh: float = 0.1,
+        override_parts_delta_thresh: float = 0.0,
         calibrate_episode: bool = True,
         episodic_trans_mode: str = "support",
+        episodic_trans_eps: float = 1e-6,
         lambda_tv: float = 0.1,
         lambda_clutter: float = 0.5,
         rgct_outer_iters: int = 5,
@@ -448,6 +745,10 @@ class RGCTDualNet(FewShotClassifier):
         use_clutter: bool = True,
         anisotropic_tv: bool = True,
         rgct_scoring: str = "primal",
+        eps_anneal_iters: int = 0,
+        eps_anneal_start: float = 0.2,
+        tv_ramp_iters: int = 0,
+        verbose_rgct: bool = False,
         scoring_mode: str = "rgct_dual",
         max_patches: int = 0,
         eps: float = 1e-12,
@@ -470,8 +771,13 @@ class RGCTDualNet(FewShotClassifier):
         self.support_gate_temp = float(support_gate_temp)
         self.support_num_iter = int(support_num_iter)
         self.alpha_global = float(alpha_global)
+        self.blend_mode = str(blend_mode).strip().lower()
+        self.blend_margin_temp = float(blend_margin_temp)
+        self.override_global_margin_thresh = float(override_global_margin_thresh)
+        self.override_parts_delta_thresh = float(override_parts_delta_thresh)
         self.calibrate_episode = bool(calibrate_episode)
         self.episodic_trans_mode = str(episodic_trans_mode).strip().lower()
+        self.episodic_trans_eps = float(episodic_trans_eps)
         self.lambda_tv = float(lambda_tv)
         self.lambda_clutter = float(lambda_clutter)
         self.rgct_outer_iters = int(rgct_outer_iters)
@@ -480,6 +786,10 @@ class RGCTDualNet(FewShotClassifier):
         self.use_clutter = bool(use_clutter)
         self.anisotropic_tv = bool(anisotropic_tv)
         self.rgct_scoring = str(rgct_scoring).strip().lower()
+        self.eps_anneal_iters = int(eps_anneal_iters)
+        self.eps_anneal_start = float(eps_anneal_start)
+        self.tv_ramp_iters = int(tv_ramp_iters)
+        self.verbose_rgct = bool(verbose_rgct)
         self.max_patches = int(max_patches)
         self.eps = float(eps)
 
@@ -495,7 +805,7 @@ class RGCTDualNet(FewShotClassifier):
 
     def _episode_stats(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         mean = images.mean(dim=(0, 2, 3), keepdim=True)
-        std = images.std(dim=(0, 2, 3), keepdim=True, unbiased=False).clamp_min(1e-6)
+        std = images.std(dim=(0, 2, 3), keepdim=True, unbiased=False).clamp_min(self.episodic_trans_eps)
         return mean, std
 
     def _resolve_images(self, query_images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -664,9 +974,9 @@ class RGCTDualNet(FewShotClassifier):
             self._build_raw_support(support_tokens)
 
         parts_logits = rgct_dual_score_batched(
-            query_tokens=query_tokens,
-            support_classes=self.support_classes,
-            support_masses=self.support_masses,
+            query_tokens,
+            self.support_classes,
+            self.support_masses,
             reg_eps=self.reg_eps,
             reg_mass=self.reg_mass,
             sinkhorn_iters=self.sinkhorn_iters,
@@ -678,6 +988,10 @@ class RGCTDualNet(FewShotClassifier):
             use_clutter=self.use_clutter,
             anisotropic_tv=self.anisotropic_tv,
             rgct_scoring=self.rgct_scoring,
+            eps_anneal_iters=self.eps_anneal_iters,
+            eps_anneal_start=self.eps_anneal_start,
+            tv_ramp_iters=self.tv_ramp_iters,
+            verbose=self.verbose_rgct,
             eps=self.eps,
         )
 
@@ -688,10 +1002,17 @@ class RGCTDualNet(FewShotClassifier):
         self.global_prototypes = torch.stack(centers, dim=0).to(device)
 
         global_logits = query_whole @ self.global_prototypes.t()
-        alpha = float(np.clip(self.alpha_global, 0.0, 1.0))
-        logits = (alpha * global_logits + (1.0 - alpha) * parts_logits).to(torch.float32)
-
-        if self.calibrate_episode:
+        if self.blend_mode == "top2_override" and self.calibrate_episode:
+            global_logits = _calibrate_episode_logits(logits=global_logits, n_way=self.n_way, reg_eps=self.reg_eps, eps=self.eps)
+        logits = _blend_global_parts_logits(
+            global_logits=global_logits, parts_logits=parts_logits,
+            alpha_global=self.alpha_global, blend_mode=self.blend_mode,
+            blend_margin_temp=self.blend_margin_temp,
+            override_global_margin_thresh=self.override_global_margin_thresh,
+            override_parts_delta_thresh=self.override_parts_delta_thresh,
+            eps=self.eps,
+        )
+        if self.calibrate_episode and self.blend_mode != "top2_override":
             logits = _calibrate_episode_logits(
                 logits=logits,
                 n_way=self.n_way,
