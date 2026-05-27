@@ -10,16 +10,14 @@ parameters:
   # ---- swept axes ----------------------------------------------------------
   dataset:
     values:
-      - ChestX
-      - ISIC
-      - Plant-Disease
-      - BCCD_WBC
-      - HEp
-      - CUB
-      - miniImageNet
-      - tieredImageNet
+      - Meta-CIFAR10
+      - Meta-CIFAR100
+      - Meta-MNIST
+      - Meta-TrafficSign
+      - Meta-Omniglot
+      - Meta-MSCOCO
   n_shot:
-    values: [1, 5]
+    value: 5
 
   # ---- episode protocol ----------------------------------------------------
   n_way:
@@ -91,11 +89,15 @@ parameters:
   wandb_entity:
     value: leathead_AQ_AM_IO
 
-  # mini_imagenet_root and tiered_imagenet_root are NOT set here; each
-  # collaborator configures them in their local rgct_main.py defaults.
+  # ---- Meta-Dataset protocol ----------------------------------------------
+  # meta_dataset_root and meta_records_root are NOT set here; each collaborator
+  # configures them in their local rgct_main.py defaults or via $META_DATASET_ROOT
+  # / $RECORDS env vars.
+  md_test_type:
+    value: 5shot
 
   note:
-    value: fixed_hparam_all_datasets
+    value: fixed_hparam_meta_dataset_5shot
 
 command:
   - /home/ahmedm04/projects/DINOSEG/.venv/bin/python
