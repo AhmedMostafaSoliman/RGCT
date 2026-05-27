@@ -38,7 +38,7 @@ parameters:
   sinkhorn_iters:
     value: 200
   use_ctb:
-    value: "true"
+    value: "false"
   n_support_atoms:
     value: 64
   bary_iters:
@@ -54,7 +54,7 @@ parameters:
   support_num_iter:
     value: 120
   alpha_global:
-    value: 0.4
+    value: 0.6
   calibrate:
     value: "true"
   episodic_trans_mode:
@@ -78,7 +78,7 @@ parameters:
   max_patches:
     value: 0
   query_chunk_size:
-    value: 32
+    value: 64
 
   # ---- wandb ---------------------------------------------------------------
   use_wandb:
