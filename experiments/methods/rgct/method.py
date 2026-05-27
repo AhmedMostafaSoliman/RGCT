@@ -384,6 +384,7 @@ def rgct_dual_score_batched(
     verbose: bool = False,
     return_diagnostics: bool = False,
     eps: float = 1e-12,
+    query_chunk_size: Optional[int] = None,
 ) -> "torch.Tensor | Tuple[torch.Tensor, Dict[str, Any]]":
     """RGCT-Dual: Principled reduced-objective solver.
 
@@ -399,10 +400,54 @@ def rgct_dual_score_batched(
     -------
     logits : [B, C]  class logits.
     """
+    # Queries are independent in this solver (Sinkhorn is bmm per-b, TV graph is
+    # per-query, Z is per-query). Chunking over B is a pure memory optimisation
+    # with identical math; useful for large Meta-Dataset episodes (B up to ~500).
+    if (
+        query_chunk_size is not None
+        and 0 < query_chunk_size < Q_batch.size(0)
+    ):
+        if return_diagnostics:
+            raise NotImplementedError(
+                "query_chunk_size cannot be combined with return_diagnostics=True"
+            )
+        logits_parts: List[torch.Tensor] = []
+        for start in range(0, Q_batch.size(0), query_chunk_size):
+            logits_parts.append(
+                rgct_dual_score_batched(
+                    Q_batch[start : start + query_chunk_size],
+                    S_classes,
+                    b_classes,
+                    reg_eps=reg_eps,
+                    reg_mass=reg_mass,
+                    sinkhorn_iters=sinkhorn_iters,
+                    lambda_tv=lambda_tv,
+                    lambda_clutter=lambda_clutter,
+                    outer_iters=outer_iters,
+                    tau_z=tau_z,
+                    z_pdhg_iters=z_pdhg_iters,
+                    use_clutter=use_clutter,
+                    anisotropic_tv=anisotropic_tv,
+                    rgct_scoring=rgct_scoring,
+                    eps_anneal_iters=eps_anneal_iters,
+                    eps_anneal_start=eps_anneal_start,
+                    tv_ramp_iters=tv_ramp_iters,
+                    verbose=verbose,
+                    return_diagnostics=False,
+                    eps=eps,
+                    query_chunk_size=None,
+                )
+            )
+        return torch.cat(logits_parts, dim=0)
+
     B, P, D = Q_batch.shape
     C = len(S_classes)
     device = Q_batch.device
     dtype = torch.float64
+    # Store [B, P, N_c] cost matrices and transport plans in float32 to halve
+    # their memory footprint; upcast to float64 only at the Sinkhorn boundary
+    # where exp(-M/reg_eps) needs float64 to avoid underflow at small reg_eps.
+    store_dtype = torch.float32
 
     K_total = C + 1 if use_clutter else C
     clutter_offset = 1 if use_clutter else 0
@@ -416,8 +461,8 @@ def rgct_dual_score_batched(
     for c in range(C):
         S_c = S_classes[c]
         N_c = S_c.size(0)
-        sim = torch.clamp(Q_batch.to(dtype) @ S_c.to(dtype).t(), -1.0, 1.0)
-        M_c = 1.0 - sim  # [B, P, N_c]
+        sim = torch.clamp(Q_batch.float() @ S_c.float().t(), -1.0, 1.0)
+        M_c = (1.0 - sim).to(store_dtype)  # [B, P, N_c]
         b_c = b_classes[c].to(device=device, dtype=dtype).unsqueeze(0).expand(B, N_c)
         total_b = b_c.sum(dim=1, keepdim=True).clamp(min=eps)
         b_c = b_c * (a.sum(dim=1, keepdim=True) / total_b)
@@ -480,7 +525,7 @@ def rgct_dual_score_batched(
             alpha_c = a * z_c  # [B, P]   row marginal for class c
 
             Gamma_c, phi_c, ws_out = _solve_semi_relaxed_ot_with_dual(
-                M_c=M_list[c],
+                M_c=M_list[c].to(dtype),
                 alpha_c=alpha_c,
                 b_c=b_list[c],
                 reg=reg_eff,
@@ -489,12 +534,15 @@ def rgct_dual_score_batched(
                 warmstart=ot_warmstarts[c],
                 eps=eps,
             )
+            Gamma_c = Gamma_c.to(store_dtype)
             plans[c] = Gamma_c
             phi_all[c] = phi_c
             ot_warmstarts[c] = ws_out
 
             # F_c value = <M_c, Gamma_c> + ε · KL(Gamma_c | c_mat)  (approx by primal cost)
-            total_ot_value = total_ot_value + (Gamma_c * M_list[c]).sum(dim=(1, 2))
+            # Compute the dot product in store_dtype to avoid materialising
+            # a float64 [B, P, N_c] temporary.
+            total_ot_value = total_ot_value + (Gamma_c * M_list[c]).sum(dim=(1, 2)).to(dtype)
 
         # ── BLOCK 2: Z update via PDHG ──
         # Build gradient G[:,:,c+offset] = a * phi_c
@@ -556,8 +604,8 @@ def rgct_dual_score_batched(
     for c in range(C):
         z_c = Z[:, :, c + clutter_offset].clamp(min=1e-8)
         alpha_c = a * z_c
-        plans[c], _, _ = _solve_semi_relaxed_ot_with_dual(
-            M_c=M_list[c],
+        final_plan, _, _ = _solve_semi_relaxed_ot_with_dual(
+            M_c=M_list[c].to(dtype),
             alpha_c=alpha_c,
             b_c=b_list[c],
             reg=reg_eps,
@@ -566,6 +614,7 @@ def rgct_dual_score_batched(
             warmstart=ot_warmstarts[c],
             eps=eps,
         )
+        plans[c] = final_plan.to(store_dtype)
 
     # ── Compute logits ──
     scoring = str(rgct_scoring).strip().lower()
@@ -573,8 +622,8 @@ def rgct_dual_score_batched(
     class_masses = torch.zeros((B, C), device=device, dtype=dtype)
 
     for c in range(C):
-        primal_costs[:, c] = (plans[c] * M_list[c]).sum(dim=(1, 2))
-        class_masses[:, c] = plans[c].sum(dim=(1, 2))
+        primal_costs[:, c] = (plans[c] * M_list[c]).sum(dim=(1, 2)).to(dtype)
+        class_masses[:, c] = plans[c].sum(dim=(1, 2)).to(dtype)
 
     if scoring == "primal":
         logits = -primal_costs
@@ -751,6 +800,7 @@ class RGCTDualNet(FewShotClassifier):
         verbose_rgct: bool = False,
         scoring_mode: str = "rgct_dual",
         max_patches: int = 0,
+        query_chunk_size: Optional[int] = None,
         eps: float = 1e-12,
     ) -> None:
         super().__init__()
@@ -791,6 +841,9 @@ class RGCTDualNet(FewShotClassifier):
         self.tv_ramp_iters = int(tv_ramp_iters)
         self.verbose_rgct = bool(verbose_rgct)
         self.max_patches = int(max_patches)
+        self.query_chunk_size = (
+            int(query_chunk_size) if query_chunk_size is not None and int(query_chunk_size) > 0 else None
+        )
         self.eps = float(eps)
 
         if self.episodic_trans_mode not in {"none", "support", "support_query", "query"}:
@@ -993,6 +1046,7 @@ class RGCTDualNet(FewShotClassifier):
             tv_ramp_iters=self.tv_ramp_iters,
             verbose=self.verbose_rgct,
             eps=self.eps,
+            query_chunk_size=self.query_chunk_size,
         )
 
         centers = []

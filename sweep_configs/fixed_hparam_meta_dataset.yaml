@@ -16,12 +16,9 @@ parameters:
       - Meta-TrafficSign
       - Meta-Omniglot
       - Meta-MSCOCO
-  n_shot:
-    value: 5
-
   # ---- episode protocol ----------------------------------------------------
-  n_way:
-    value: 5
+  # n_way and n_shot omitted: Meta-Dataset runs ignore them and use the
+  # protocol selected by md_test_type below.
   backbone:
     value: vits16
   n_query:
@@ -80,6 +77,8 @@ parameters:
     value: primal
   max_patches:
     value: 0
+  query_chunk_size:
+    value: 32
 
   # ---- wandb ---------------------------------------------------------------
   use_wandb:

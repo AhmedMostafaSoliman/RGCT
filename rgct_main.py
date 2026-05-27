@@ -567,6 +567,12 @@ def add_rgct_args(parser: argparse.ArgumentParser) -> None:
         choices=["primal", "mass", "hybrid"],
     )
     parser.add_argument("--max_patches", type=int, default=0)
+    parser.add_argument(
+        "--query_chunk_size",
+        type=int,
+        default=0,
+        help="Process Meta-Dataset queries in chunks of this size to cap peak memory. 0 disables chunking.",
+    )
 
 
 def collect_rgct_params(args) -> Dict[str, object]:
@@ -595,6 +601,7 @@ def collect_rgct_params(args) -> Dict[str, object]:
         "anisotropic_tv": args.anisotropic_tv,
         "rgct_scoring": args.rgct_scoring,
         "max_patches": args.max_patches,
+        "query_chunk_size": args.query_chunk_size if args.query_chunk_size > 0 else None,
     }
 
 
