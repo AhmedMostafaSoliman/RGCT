@@ -1,0 +1,118 @@
+program: rgct_main.py
+method: grid
+metric:
+  name: avg_accuracy_pct
+  goal: maximize
+entity: leathead_AQ_AM_IO
+project: RGCT
+
+parameters:
+  # ---- swept axes ----------------------------------------------------------
+  dataset:
+    values:
+      - ChestX
+      - ISIC
+      - Plant-Disease
+      - BCCD_WBC
+      - HEp
+      - CUB
+      - miniImageNet
+      - tieredImageNet
+      - Meta-CIFAR10
+      - Meta-CIFAR100
+      - Meta-MNIST
+      - Meta-TrafficSign
+      - Meta-Omniglot
+      - Meta-MSCOCO
+  n_shot:
+    values: [1, 5]
+
+  # ---- episode protocol ----------------------------------------------------
+  n_way:
+    value: 5
+  backbone:
+    value: vits16
+  n_query:
+    value: 10
+  n_test_tasks:
+    value: 1000
+  n_workers:
+    value: 8
+  use_specific_trans:
+    value: "true"
+
+  # ---- locked RGCT-Dual v9 sharp hparams -----------------------------------
+  reg_eps:
+    value: 0.02
+  reg_mass:
+    value: 0.3
+  sinkhorn_iters:
+    value: 200
+  use_ctb:
+    value: "true"
+  n_support_atoms:
+    value: 64
+  bary_iters:
+    value: 5
+  bary_inner_max:
+    value: 30
+  support_mix:
+    value: 0.5
+  support_trim_ratio:
+    value: 0.95
+  support_gate_temp:
+    value: 0.5
+  support_num_iter:
+    value: 120
+  alpha_global:
+    value: 0.4
+  calibrate:
+    value: "true"
+  episodic_trans_mode:
+    value: support
+  lambda_tv:
+    value: 0.1
+  lambda_clutter:
+    value: 0.5
+  rgct_outer_iters:
+    value: 5
+  tau_z:
+    value: 0.1
+  z_pdhg_iters:
+    value: 50
+  use_clutter:
+    value: "true"
+  anisotropic_tv:
+    value: "true"
+  rgct_scoring:
+    value: primal
+  max_patches:
+    value: 0
+
+  # ---- wandb ---------------------------------------------------------------
+  use_wandb:
+    value: "true"
+  wandb_project:
+    value: RGCT
+  wandb_entity:
+    value: leathead_AQ_AM_IO
+
+  # ---- dataset path overrides (match the existing per-dataset sweeps) ------
+  mini_imagenet_root:
+    value: /home_old/ahmedm04/few_shot_ds/mini-imagenet-tools/mini_imagenet_split/val
+  tiered_imagenet_root:
+    value: /home_old/ahmedm04/few_shot_ds/tiered-imagenet-tools/tiered_imagenet/val
+  meta_dataset_root:
+    value: /home/ahmedm04/projects/RGCT/meta-dataset
+  meta_records_root:
+    value: /home_old/ahmedm04/few_shot_ds/meta-dataset/processed_data
+  md_test_type:
+    value: standard
+
+  note:
+    value: fixed_hparam_all_datasets
+
+command:
+  - /home/ahmedm04/projects/DINOSEG/.venv/bin/python
+  - ${program}
+  - ${args}
