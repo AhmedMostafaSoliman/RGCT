@@ -1,0 +1,89 @@
+program: rgct_main.py
+method: bayes
+metric:
+  name: avg_accuracy_pct
+  goal: maximize
+entity: leathead_AQ_AM_IO
+project: RGCT
+name: hparam_no_ctb_meta_cifar10
+run_cap: 50
+
+parameters:
+  dataset:
+    value: Meta-CIFAR10
+
+  # ---- episode protocol ----------------------------------------------------
+  backbone:
+    value: vits16
+  n_query:
+    value: 10
+  n_test_tasks:
+    value: 300
+  n_workers:
+    value: 8
+  use_specific_trans:
+    value: "true"
+
+  # ---- swept non-CTB RGCT hparams -----------------------------------------
+  reg_eps:
+    values: [0.01, 0.02, 0.05]
+  reg_mass:
+    values: [0.1, 0.3, 0.5]
+  alpha_global:
+    values: [0.2, 0.4, 0.6, 0.8]
+  lambda_tv:
+    values: [0.0, 0.05, 0.1, 0.2]
+  lambda_clutter:
+    values: [0.0, 0.25, 0.5, 1.0]
+  rgct_outer_iters:
+    values: [3, 5, 8]
+  tau_z:
+    values: [0.05, 0.1, 0.2]
+
+  # ---- fixed RGCT settings -------------------------------------------------
+  sinkhorn_iters:
+    value: 200
+  use_ctb:
+    value: "false"
+  calibrate:
+    value: "true"
+  episodic_trans_mode:
+    value: support
+  z_pdhg_iters:
+    value: 50
+  use_clutter:
+    value: "true"
+  anisotropic_tv:
+    value: "true"
+  rgct_scoring:
+    value: primal
+  max_patches:
+    value: 0
+  query_chunk_size:
+    value: 64
+
+  # ---- wandb ---------------------------------------------------------------
+  use_wandb:
+    value: "true"
+  wandb_project:
+    value: RGCT
+  wandb_entity:
+    value: leathead_AQ_AM_IO
+  wandb_tags:
+    value: meta_no_ctb_sweep,5shot
+
+  # ---- Meta-Dataset protocol ----------------------------------------------
+  # Data roots are intentionally not sweep parameters. Set RGCT_META_RECORDS_ROOT,
+  # DATADIR, or RECORDS in the Slurm job environment before starting wandb agent.
+  md_test_type:
+    value: 5shot
+
+  note:
+    value: hparam_no_ctb_meta_cifar10_5shot
+
+command:
+  - /bin/bash
+  - -lc
+  - 'DATA_ROOT="${RGCT_META_RECORDS_ROOT:-${DATADIR:-${RECORDS:-}}}"; : "${DATA_ROOT:?Set RGCT_META_RECORDS_ROOT, DATADIR, or RECORDS to the Meta-Dataset records root}"; exec "${RGCT_PYTHON:-python}" rgct_main.py "$@" --meta_records_root "$DATA_ROOT" --meta_dataset_root "${META_DATASET_ROOT:-meta-dataset}"'
+  - rgct_meta_sweep
+  - ${args}
