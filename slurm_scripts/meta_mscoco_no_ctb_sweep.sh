@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=a100:4
-#SBATCH --ntasks-per-node=34
-#SBATCH --mem=127000M
-#SBATCH --time=40:00:00
+#SBATCH --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32000M
+#SBATCH --time=24:00:00
 #SBATCH --job-name=rgct_meta_mscoco
 
 # W&B hyperparameter sweep agent for RGCT on Meta-MSCOCO.
@@ -11,8 +11,8 @@
 #   https://wandb.ai/leathead_AQ_AM_IO/RGCT/sweeps/vjdus8f2
 #
 # Usage:
+#   sbatch meta_mscoco_no_ctb_sweep.sh
 #   DATADIR=/path/to/meta-dataset/processed_data sbatch meta_mscoco_no_ctb_sweep.sh
-#   DATA_DIR=/path/to/meta-dataset/processed_data bash meta_mscoco_no_ctb_sweep.sh
 
 set -eo pipefail
 
@@ -22,13 +22,13 @@ SWEEP_ID="leathead_AQ_AM_IO/RGCT/vjdus8f2"
 
 # Meta-Dataset records root. Keep this outside the sweep so Slurm jobs can
 # change it per machine or allocation.
-DATADIR="${RGCT_META_RECORDS_ROOT:-${DATADIR:-${DATA_DIR:-${RECORDS:-}}}}"
+DATADIR="${RGCT_META_RECORDS_ROOT:-${DATADIR:-${DATA_DIR:-${RECORDS:-/scratch/ranger/meta-dataset/processed_data}}}}"
 
 # Repo root. Submit from the repo root, or set REPO_DIR explicitly.
 REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
 
 # Optional virtualenv and Python override.
-RGCT_ENV="${RGCT_ENV:-/home/ahmedm04/projects/DINOSEG/.venv}"
+RGCT_ENV="${RGCT_ENV:-$REPO_DIR/ENV}"
 RGCT_PYTHON="${RGCT_PYTHON:-python}"
 
 # Parallel W&B agents to launch (0 => one per visible GPU).
@@ -38,6 +38,20 @@ NUM_AGENTS="${NUM_AGENTS:-0}"
 if [ -z "$DATADIR" ]; then
     echo "ERROR: set DATADIR, DATA_DIR, RECORDS, or RGCT_META_RECORDS_ROOT." >&2
     exit 1
+fi
+
+if [ -n "${SLURM_TMPDIR:-}" ]; then
+    SOURCE_DATADIR="$DATADIR"
+    STAGED_DATADIR="$SLURM_TMPDIR/meta-dataset/processed_data"
+    echo "Copying data from $SOURCE_DATADIR to $STAGED_DATADIR"
+    mkdir -p "$(dirname "$STAGED_DATADIR")"
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a "$SOURCE_DATADIR"/ "$STAGED_DATADIR"/
+    else
+        mkdir -p "$STAGED_DATADIR"
+        cp -a "$SOURCE_DATADIR"/. "$STAGED_DATADIR"/
+    fi
+    DATADIR="$STAGED_DATADIR"
 fi
 
 if [ -n "${SLURM_TMPDIR:-}" ]; then

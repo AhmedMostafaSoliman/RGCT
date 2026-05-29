@@ -1,0 +1,28 @@
+# Core RGCT runtime dependencies
+easyfsl
+numpy
+pandas
+Pillow
+torch
+torchvision
+tqdm
+wandb
+
+# DINO attention visualization utilities
+matplotlib
+# opencv-python
+requests
+scikit-image
+
+# Official Meta-Dataset evaluation dependencies
+absl-py
+etils
+gin-config
+scikit-learn
+scipy
+setuptools
+six
+tensorflow
+# tensorflow-datasets
+tensorflow-probability
+# tf-models-official
